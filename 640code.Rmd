@@ -1,0 +1,741 @@
+---
+title: "640project"
+author: "Xinyu Lin"
+date: "2025-04-28"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(patchwork)
+library(gridExtra)
+library(caret)
+library(glmnet)
+library(Metrics)
+library(randomForest)
+library(ranger)
+library(xgboost)
+library(Matrix)
+```
+
+## Load the data
+
+```{r}
+yellow_taxi <- readxl::read_xlsx("/Users/linxinyu/Documents/umich/courses/640/yellow_final.xlsx")
+hvfhv <- readxl::read_xlsx("/Users/linxinyu/Documents/umich/courses/640/hvfhv_final.xlsx")
+head(yellow_taxi)
+head(hvfhv)
+```
+
+## Data cleaning
+
+### Data structure inspection
+
+```{r}
+str(yellow_taxi)
+summary(yellow_taxi)
+str(hvfhv)
+summary(hvfhv)
+```
+
+I used two sets of travel data from the New York City transportation system: one is the traditional taxi (yellow taxi) order data, and the other is the high volume for-hire vehicle (HVFHV) order data. The yellow_taxi dataset covers 1,048,575 yellow taxi trips in New York City during December 2024, mainly reflecting the operating characteristics and carbon emissions of traditional taxis; while the hvfhv dataset collects 858,167 high volume for-hire vehicle trips during the same period, representing the operating data of online ride-hailing platforms such as Uber and Lyft. The two types of travel modes may differ in trip characteristics, speed distribution, emissions, etc., so it is important to describe and compare them separately.
+
+In the yellow_taxi dataset, each record contains 13 variables. pickup_datetime and dropoff_datetime record the specific time when the passenger gets on and off the bus, accurate to seconds, which are used to calculate the trip duration and traffic peak analysis. trip_distance is the ground distance traveled from pickup to drop-off (in miles), which usually reflects the distance of passengers' trips, but there are abnormally long distances (over 3,000 miles) in the data. PULocationID and DOLocationID are the taxi zone codes designated by New York City, which are used to identify the geographical locations of pickup and drop-off. pickup_borough and dropoff_borough are the names of the administrative districts mapped to the above codes (such as Manhattan, Queens, etc.), which are helpful for analyzing inter-regional mobility patterns.
+
+trip_time is the duration of the trip (in seconds), which reflects the time it takes for passengers to travel; avg_speed_mph is the average speed (in miles per hour) calculated based on the trip distance and trip time. In theory, it should be within the normal range of urban traffic (usually less than 60 mph), but there are extreme outliers. RatePerDistance represents the average payment per mile of travel, reflecting the economic efficiency and pricing characteristics of travel. This value is missing in some records. CarbonEmission_g is the carbon emissions (in grams) estimated based on trip characteristics, which is used for environmental impact assessment. PM2.5 records the concentration of fine particulate matter (micrograms per cubic meter) in the corresponding area during the trip, which is an important indicator for measuring air quality, but there are some unreasonable negative values in the data. avg_temp represents the average temperature (Fahrenheit) during the trip, which is also related to driving comfort and pollution emissions.
+
+Similarly, the hvfhv dataset also contains 13 variables, but some fields are named slightly differently. For example, the trip distance is named trip_miles, which has the same meaning as trip_distance in yellow_taxi, that is, the ground mileage of a passenger's single trip. The definitions of other variables are basically the same as those of the yellow taxi data, including pick-up and drop-off time, location number, administrative division information, trip duration, average speed, trip cost density (RatePerDistance), carbon emissions, PM2.5 pollution level, and average temperature. Overall, the average trip distance recorded by HVFHV travel is slightly longer, and the average carbon emissions are higher, reflecting that online ride-hailing may generate higher emissions due to a larger proportion of long-distance orders. In addition, there are some irregular spellings in the pickup_borough and dropoff_borough fields (such as "staten_island" is not capitalized), which need to be standardized before further analysis.
+
+Based on preliminary observations, the two datasets are highly similar in scale, structure, and record type, but each has different degrees of outliers and missing values, which need to be corrected through cleaning and standardization in subsequent analysis.
+
+### Checking missing values
+
+```{r}
+colSums(is.na(yellow_taxi));colSums(is.na(hvfhv))
+```
+
+#### handle PM2.5
+
+```{r}
+pm25_reference <- read.csv("/Users/linxinyu/Documents/umich/courses/640/air_quality_grouped.csv")
+yellow_taxi_clean <- tibble()
+hvfhv_clean <- tibble()
+yellow_taxi_clean <- yellow_taxi %>%
+    mutate(pickup_datetime = as.POSIXct(pickup_datetime),
+         datetime_hour = floor_date(pickup_datetime, unit = "hour"),
+         dropoff_borough = tolower(dropoff_borough))
+hvfhv_clean <-hvfhv %>%
+    mutate(pickup_datetime = as.POSIXct(pickup_datetime),
+         datetime_hour = floor_date(pickup_datetime, unit = "hour"),
+         dropoff_borough = tolower(dropoff_borough))
+```
+
+```{r}
+pm25_reference <- pm25_reference%>%
+  mutate(local_hour = as.POSIXct(local_hour))
+yellow_taxi_clean <- yellow_taxi_clean %>%
+    left_join(pm25_reference, by = c("dropoff_borough" = "region", "datetime_hour" = "local_hour")) %>%
+  mutate(PM2.5 = ifelse(is.na(PM2.5.x), PM2.5.y, PM2.5.x)) %>%
+  select(-PM2.5.x, -PM2.5.y)
+hvfhv_clean <- hvfhv_clean %>%
+  left_join(pm25_reference, by = c("dropoff_borough" = "region", "datetime_hour" = "local_hour")) %>%
+  mutate(PM2.5 = ifelse(is.na(PM2.5.x), PM2.5.y, PM2.5.x)) %>%
+  select(-PM2.5.x, -PM2.5.y)
+yellow_taxi_clean %>%
+  filter(is.na(PM2.5))
+yellow_taxi_clean <- yellow_taxi_clean %>%
+  filter(!is.na(PM2.5))
+yellow_taxi_clean <-yellow_taxi_clean%>%
+  select(-NO2, -OZONE, -datetime_hour)
+hvfhv_clean <-hvfhv_clean%>%
+  select(-NO2, -OZONE, -datetime_hour)
+colSums(is.na(yellow_taxi_clean));colSums(is.na(hvfhv_clean))
+```
+
+In my initial exploration, I found that some trip records in the yellow_taxi and hvfhv datasets were missing PM2.5 information. Given that air pollution levels are key analysis variables, I performed the following processing to improve data integrity:
+
+First, import the reference dataset pm25_reference, which records PM2.5 concentrations in different regions and hours. To match the table, we convert pickup_datetime in the original dataset to POSIXct format and generate a datetime_hour field with hourly granularity, while converting dropoff_borough to lowercase letters.
+
+Then, dropoff_borough and datetime_hour are joined with region and local_hour of the reference table. For missing PM2.5 values, reference data is used first to fill in, and existing values are retained. Redundant fields are cleared after joining.
+
+After the analysis, I found that there were still missing values. The reason for the missing values was that I got unexpected data for December, so I chose to delete the records with missing PM2.5 and removed the NO2, OZONE, and datetime_hour fields that were not relevant to the analysis. Finally, I checked and confirmed that there were no other missing issues in the two datasets.
+
+#### Handle RatePerDistance and CarbonEmission_g
+
+```{r}
+hvfhv_clean %>%
+  filter(is.na(RatePerDistance))%>%
+  filter(trip_miles < 1) %>%
+  nrow()
+yellow_taxi_clean %>%
+  filter(is.na(RatePerDistance))%>%
+  filter(trip_distance <1)%>%
+  nrow()
+hvfhv_clean %>%
+  filter(is.na(RatePerDistance))%>%
+  filter(trip_miles >= 1)
+yellow_taxi_clean %>%
+  filter(is.na(RatePerDistance))%>%
+  filter(trip_distance >= 1)
+yellow_taxi_clean <- yellow_taxi_clean %>%
+  filter(!is.na(RatePerDistance))
+hvfhv_clean <- hvfhv_clean %>%
+  filter(!is.na(RatePerDistance))
+colSums(is.na(yellow_taxi_clean));colSums(is.na(hvfhv_clean))
+```
+
+During further data cleaning, I focused on the presence of missing values for RatePerDistance. Initial screening showed that some trips in both yellow_taxi_clean and hvfhv_clean datasets were missing this field. In order to determine whether these missing values stemmed from data anomalies, we further categorized the trips based on trip distance: we first filtered out all records where RatePerDistance was missing and the trip distance (trip_miles or trip_distance) was less than 1 mile. Since these very short-distance trips are prone to positioning errors or anomalous entries that result in missing pricing information, it is hypothesized that they are likely to be anomalous data. For the cases where the trip distance is more than 1 mile but the cost is missing, although the percentage is small, we also choose to exclude them together to ensure data consistency and subsequent modeling specification.
+
+#### Handle average temperature
+
+```{r}
+yellow_taxi_clean <- yellow_taxi_clean %>%
+    mutate(pickup_datetime = as.POSIXct(pickup_datetime),
+         datetime = as.Date(pickup_datetime))
+hvfhv_clean <-hvfhv_clean %>%
+    mutate(pickup_datetime = as.POSIXct(pickup_datetime),
+         datetime = as.Date(pickup_datetime))
+```
+
+```{r}
+weather <- read.csv("/Users/linxinyu/Documents/umich/courses/640/weather_all.csv")
+weather <- weather%>%
+  mutate(pickup_date = as.POSIXct(pickup_date))
+yellow_taxi_clean <- yellow_taxi_clean %>%
+    left_join(weather, by = c("dropoff_borough" = "region", "datetime" = "pickup_date")) %>%
+  mutate(avg_temp = ifelse(is.na(avg_temp.x), avg_temp.y, avg_temp.x)) %>%
+  select(-avg_temp.x, -avg_temp.y)
+hvfhv_clean <- hvfhv_clean %>%
+  left_join(weather, by = c("dropoff_borough" = "region", "datetime" = "pickup_date")) %>%
+  mutate(avg_temp = ifelse(is.na(avg_temp.x), avg_temp.y, avg_temp.x)) %>%
+  select(-avg_temp.x, -avg_temp.y)
+yellow_taxi_clean %>%filter(is.na(avg_temp))
+yellow_taxi_clean <- yellow_taxi_clean %>%
+  filter(!is.na(avg_temp))
+colSums(is.na(yellow_taxi_clean));colSums(is.na(hvfhv_clean))
+```
+
+I further addressed missing values in the avg_temp (average air temperature) variable. Considering that temperature is an important environmental factor that affects carbon emissions and transportation conditions, ensuring the completeness of this variable is crucial for subsequent analysis.
+
+For this purpose, we introduced the external weather dataset weather, which contains information on the average temperature of different regions on different dates. For data matching, we first convert the pickup_datetime in yellow_taxi_clean and hvfhv_clean to date granularity (datetime) and standardize the date field pickup_date in the weather table to time format. Subsequently, a left join is performed with the weather data by dropoff_borough and trip date (datetime), respectively.
+
+In the process of adding, the avg_temp of the joined weather data is used to fill in the missing records of avg_temp in the original data, and the original values are kept for the trips that already have temperature records. After completing the complement, the redundant fields generated by the join are cleared.
+
+#### Handle boroughs
+
+```{r}
+yellow_taxi_clean <- yellow_taxi_clean %>%
+  filter(!is.na(pickup_borough), !is.na(dropoff_borough))
+hvfhv_clean <- hvfhv_clean %>%
+  filter(!is.na(pickup_borough), !is.na(dropoff_borough))
+```
+
+```{r}
+#write.csv(yellow_taxi_clean, "yellow_processed.csv")
+#write.csv(hvfhv_clean, "hvfhv_processed.csv")
+```
+
+```{r}
+yellow_taxi <- read.csv("/Users/linxinyu/Documents/umich/courses/640/yellow_processed.csv")
+hvfhv <- read.csv("/Users/linxinyu/Documents/umich/courses/640/hvfhv_processed.csv")
+```
+
+```{r}
+yellow_taxi <- yellow_taxi %>%
+  filter(!is.na(RatePerDistance))
+yellow_taxi <- yellow_taxi %>%
+  filter(PM2.5>0)%>%
+  filter(!(pickup_borough %in% c("Unknown", "EWR")))%>%
+  filter(!(dropoff_borough %in% c("unknown", "ewr")))
+hvfhv <- hvfhv%>%
+  filter(PM2.5>0)
+colSums(is.na(yellow_taxi));colSums(is.na(hvfhv))
+```
+
+During the cleaning process, I screened trip records for borough information. Since this study focuses on the five boroughs of New York City (Manhattan, Brooklyn, Queens, Bronx, and Staten Island), records with missing origin (pickup_borough) or destination (dropoff_borough) information needed to be eliminated.
+
+### Transformation of datetime
+
+```{r}
+hvfhv$pickup_datetime <- as.POSIXct(hvfhv$pickup_datetime, format="%Y-%m-%d %H:%M:%S")
+hvfhv <- hvfhv %>%
+  filter(!is.na(pickup_datetime))
+hvfhv$pickup_hour <- as.numeric(format(hvfhv$pickup_datetime, "%H"))
+hvfhv$time_period <- with(hvfhv, ifelse(pickup_hour >= 0 & pickup_hour < 6, "Late Night",
+                           ifelse(pickup_hour >= 6 & pickup_hour < 12, "Morning",
+                           ifelse(pickup_hour >= 12 & pickup_hour < 18, "Afternoon",
+                           "Evening"))))
+```
+
+```{r}
+yellow_taxi$pickup_datetime <- as.POSIXct(yellow_taxi$pickup_datetime, format="%Y-%m-%d %H:%M:%S")
+yellow_taxi <- yellow_taxi %>%
+  filter(!is.na(pickup_datetime))
+yellow_taxi$pickup_hour <- as.numeric(format(yellow_taxi$pickup_datetime, "%H"))
+yellow_taxi$time_period <- with(yellow_taxi, ifelse(pickup_hour >= 0 & pickup_hour < 6, "Late Night",
+                           ifelse(pickup_hour >= 6 & pickup_hour < 12, "Morning",
+                           ifelse(pickup_hour >= 12 & pickup_hour < 18, "Afternoon",
+                           "Evening"))))
+```
+
+To further characterize the trips, we classify each record in the yellow_taxi_clean and hvfhv_clean datasets into the time period it belongs to based on the time of boarding (pickup_datetime). First, the pickup time was normalized to POSIXct format and missing records were eliminated. Then, the pickup_hour is extracted and the trip is divided into four time periods based on the hour: Late Night from 0:00 to 6:00, Morning from 6:00 to 12:00, Afternoon from 12:00 to 18:00, and Evening from 18:00 to 24:00.
+
+## Preliminary Analysis
+
+### Univariate Analysis
+
+```{r}
+# average speed
+p1 <- ggplot(hvfhv, aes(x = avg_speed_mph)) +
+  geom_histogram(binwidth = 2, fill = "skyblue", color = "black") +
+  labs(title = "Average Speed", x = "Average Speed (mph)", y = "Count")
+
+# Carbon Emission
+p2 <- ggplot(hvfhv, aes(x = CarbonEmission_g)) +
+  geom_histogram(binwidth = 50, fill = "lightgreen", color = "black") +
+  labs(title = "Carbon Emission", x = "Carbon Emission (g)", y = "Count")
+
+# PM2.5
+p3 <- ggplot(hvfhv, aes(x = PM2.5)) +
+  geom_histogram(binwidth = 5, fill = "lightcoral", color = "black") +
+  labs(title = "PM2.5", x = "PM2.5 Concentration (µg/m³)", y = "Count")
+
+# average tempture
+p4 <- ggplot(hvfhv, aes(x = avg_temp)) +
+  geom_histogram(binwidth = 2, fill = "plum", color = "black") +
+  labs(title = "Average Temperature", x = "Average Temperature (°F)", y = "Count")
+
+# pickup time
+p5 <- ggplot(hvfhv, aes(x = time_period)) +
+  geom_bar(fill = "plum", color = "black") +
+  labs(title = "Time Period",
+       x = "Time Period", y = "Count") +
+  theme_minimal()
+grid.arrange(p1, p2,p3, p4,p5, ncol = 3)
+```
+
+To gain a deeper understanding of the characteristics of online ride-hailing (HVFHV) travel, I conducted a univariate exploratory analysis of key variables. First, in terms of carbon emissions, the distribution of CarbonEmission_g shows a clear right-skewed characteristic, with emissions for most trips concentrated in the range below 2,000 grams, and fewer records exceeding 5,000 grams. This long-tailed distribution indicates that high emission values ​​are often associated with extreme travel conditions (such as long distances or severe congestion), and the variable may need to be logarithmically transformed or outlier processed in subsequent modeling to reduce the impact of extreme values.
+
+The distribution of average speed (avg_speed_mph) also shows a clear right-skewed characteristic, with speeds for most trips concentrated between 10 and 20 miles per hour, with the main peak occurring at about 12 mph. This is consistent with the urban road conditions in New York City, reflecting that online ride-hailing vehicles mostly operate in congested or speed-limited areas, and there are relatively few trips at higher speeds.
+
+In terms of environmental variables, the distribution of PM2.5 is relatively concentrated between 30 and 50 μg/m³, with a peak at around 45 μg/m³, indicating that most trips occur under medium or moderate pollution levels, which is representative. The average temperature (avg_temp) shows that the data is concentrated in a narrow range of 31 to 36°F, reflecting that the data is mainly collected in winter or cold months.
+
+In addition, we classified and counted the time period variable time_period, and the results showed that the trip volume peaked in the morning (6:00–12:00), followed by the afternoon, evening, and late night. This pattern reflects that the demand for online ride-hailing is most concentrated during the morning peak period, suggesting that the model should consider time specificity when predicting carbon emissions or optimizing routes.
+
+```{r}
+# average speed
+p6 <- ggplot(yellow_taxi, aes(x = avg_speed_mph)) +
+  geom_histogram(binwidth = 2, fill = "skyblue", color = "black") +
+  labs(title = "Average Speed", x = "Average Speed (mph)", y = "Count")
+
+# Carbon Emission
+p7 <- ggplot(yellow_taxi, aes(x = CarbonEmission_g)) +
+  geom_histogram(binwidth = 50, fill = "lightgreen", color = "black") +
+  labs(title = "Carbon Emission", x = "Carbon Emission (g)", y = "Count")
+
+# PM2.5
+p8 <- ggplot(yellow_taxi, aes(x = PM2.5)) +
+  geom_histogram(binwidth = 5, fill = "lightcoral", color = "black") +
+  labs(title = "PM2.5", x = "PM2.5 Concentration (µg/m³)", y = "Count")
+
+# average tempture
+p9 <- ggplot(yellow_taxi, aes(x = avg_temp)) +
+  geom_histogram(binwidth = 2, fill = "plum", color = "black") +
+  labs(title = "Average Temperature", x = "Average Temperature (°F)", y = "Count")
+
+p10 <- ggplot(yellow_taxi, aes(x = time_period)) +
+  geom_bar(fill = "plum", color = "black") +
+  labs(title = "Time Period",
+       x = "Time Period", y = "Count") +
+  theme_minimal()
+grid.arrange(p6, p7,p8, p9,p10, ncol = 3)
+```
+
+In this section, I conduct exploratory analysis on the average speed, carbon emissions, PM2.5, temperature, and travel time of taxi trips.
+
+First, from the distribution of average speed, the data is obviously right-skewed, with the speed of most trips below 10 kilometers per hour, and it is extremely rare to exceed 30 kilometers per hour.
+
+The distribution of carbon emissions is also highly skewed, with a large number of records concentrated in the low emission range, while very few trips show significantly high emission values. This long-tail distribution may be due to some long-distance trips or extremely low-speed operation resulting in reduced emission efficiency.
+
+In terms of air quality, the distribution of PM2.5 concentration is roughly normal, with the main peak concentrated between 30 and 40 µg/m³, indicating that air pollution is at a medium to high level during the taxi operation period.
+
+The distribution of temperature shows an irregular bimodal structure, with a large frequency concentrated in the 35°F and 45°F ranges, suggesting that data collection may be concentrated in the spring and winter transition seasons. Although the direct impact of temperature on carbon emissions is limited, its indirect effect cannot be ignored: temperature changes may indirectly affect emission levels by affecting travel demand, driving behavior and even engine thermal efficiency.
+
+Finally, statistics on travel time periods show that taxi trips are most concentrated in the Afternoon and Evening periods, followed by Morning, and relatively less in Late Night. This result reflects the obvious peak pattern of commuting and daily activities, and also shows that time period is a grouping variable worthy of inclusion in the model, which can effectively capture the temporal heterogeneity of traffic intensity and emission characteristics.
+
+### Bivariate or Multivariate Analysis
+
+**Carbon Emission vs trip distance**
+
+```{r}
+plot1 <- ggplot(hvfhv, aes(x = trip_miles, y = CarbonEmission_g)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, color = "darkgreen") +
+  labs(title = "hvfhv", x = "Trip Distance (miles)", y = "Carbon Emission (g)")
+plot2 <- ggplot(yellow_taxi, aes(x = trip_distance, y = CarbonEmission_g)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, color = "darkgreen") +
+  labs(title = "Taxi", x = "Trip Distance (miles)", y = "Carbon Emission (g)")
+grid.arrange(plot1, plot2, ncol = 2)
+```
+
+It is clear from the figure that carbon emissions show an approximately linear relationship with trip distance. As the distance traveled increases, carbon emissions rise, a result that is consistent with our basic knowledge of the mechanism of motor vehicle emissions: the longer the mileage traveled, the more fuel is consumed, and the higher the corresponding CO₂ emissions, controlling for other conditions (e.g., speed, level of congestion, and type of vehicle) that are roughly stable.
+
+The data in the left panel are concentrated within 0 to 100 miles, with a dense point cloud, a clear linear relationship, and a stable slope of the regression line, suggesting that the proportionality between carbon emissions and distance is relatively stable over the range of daily travel. The right panel has a wider scale, incorporating samples of extreme long-distance trips. It can be seen that while the main trend remains linear, there are certain outliers in the long-distance range, and these may correspond to interstate travel, extreme congestion scenarios, or recording errors.
+
+**PM2.5 boxplots for different Boroughs**
+
+```{r}
+plot3 <- hvfhv %>%
+  ggplot(aes(x = reorder(pickup_borough, PM2.5, FUN = median), y = PM2.5)) +
+  geom_boxplot(fill = "lightblue") +
+  coord_flip() +
+  labs(title = "hvfhv", x = "Borough", y = "PM2.5 Concentration (µg/m³)")
+plot4 <- yellow_taxi %>%
+  ggplot(aes(x = reorder(pickup_borough, PM2.5, FUN = median), y = PM2.5)) +
+  geom_boxplot(fill = "lightblue") +
+  coord_flip() +
+  labs(title = "taxi", x = "Borough", y = "PM2.5 Concentration (µg/m³)")
+grid.arrange(plot3, plot4, ncol = 2)
+```
+
+Overall, the PM2.5 distribution of the two types of services showed highly consistent spatial heterogeneity, indicating that air pollution levels vary significantly between different regions.
+
+In the online ride-hailing data, the median PM2.5 in Queens and Brooklyn was significantly higher than that in other boroughs, with a distribution concentrated between 43–47 µg/m³; Manhattan and the Bronx were second, and the median in Staten Island was relatively low, around 37 µg/m³. This trend may reflect the differences in vehicle density and traffic flow between regions, especially in Queens and Brooklyn, which are transportation hubs and densely populated residential areas, with heavy traffic pressure and more significant pollution.
+
+In contrast, the PM2.5 distribution of taxi data is more extensive, especially in Queens and the Bronx, where the upper quartile extends to 50 µg/m³ or even higher, and individual outliers exceed 60 µg/m³, indicating that air quality is more volatile. Staten Island and Manhattan are generally lower than other areas, especially Staten Island, whose low-tail outliers are worth noting, which may be due to its lower overall motor vehicle density and higher green space ratio.
+
+**Boxplots of average temperatures for different Boroughs**
+
+```{r}
+plot5 <- hvfhv %>%
+  ggplot(aes(x = reorder(pickup_borough, avg_temp, FUN = median), y = avg_temp)) +
+  geom_boxplot(fill = "lightpink") +
+  coord_flip() +
+  labs(title = "hvfhv", x = "Borough", y = "Average Temperature (°F)")
+plot6 <- yellow_taxi %>%
+  ggplot(aes(x = reorder(pickup_borough, avg_temp, FUN = median), y = avg_temp)) +
+  geom_boxplot(fill = "lightpink") +
+  coord_flip() +
+  labs(title = "taxi", x = "Borough", y = "Average Temperature (°F)")
+grid.arrange(plot5, plot6, ncol = 2)
+```
+
+In the hvfhv section, the temperature distribution varies significantly between districts. Queens and Bronx are significantly higher than other districts, with medians around 35–36°F, while Brooklyn and Staten Island are lower, concentrated in the 31–33°F range. Manhattan's data distribution is unusually narrow, with almost no upper and lower quartile range, which may be due to the small sample size or the short data recording period.
+
+In contrast, the temperature distribution in the taxi data is smoother and more reasonable. The temperature distribution of each district overlaps a lot, indicating that the sampling period is more consistent. The median is roughly concentrated in the 34–38°F range, with the Bronx having the widest temperature range, while Manhattan, Queens and other areas are slightly more concentrated. It is worth noting that some areas (such as Queens and Manhattan) have high temperature anomalies, which may reflect individual abnormal days (such as abnormal warming in winter) or data problems.
+
+### Outlier
+
+```{r}
+hvfhv <- hvfhv %>%
+  mutate(log_CarbonEmission = log1p(CarbonEmission_g))
+plot7 <- ggplot(hvfhv, aes(x = log_CarbonEmission)) +
+  geom_histogram(binwidth = 5, fill = "skyblue", color = "black") +
+  labs(title = "hvfhv")
+```
+
+```{r}
+yellow_taxi <- yellow_taxi%>%
+  mutate(log_CarbonEmission = log1p(CarbonEmission_g))
+plot8 <- ggplot(hvfhv, aes(x = log_CarbonEmission)) +
+  geom_histogram(binwidth = 5, fill = "skyblue", color = "black") +
+  labs(title = "taxi")
+grid.arrange(plot7, plot8, ncol = 2)
+```
+
+The original carbon emission variable is highly right-skewed, which is very unfavorable for modeling, especially when using linear regression or tree models, which will amplify the impact of extreme values. Therefore, we use log1p() to logarithmically transform the carbon emission values. As can be seen from the figure, after the transformation, most of the sample log(emissions) in the two data sets are concentrated around 5, and very few high values ​​are compressed into a more reasonable range, and the overall distribution is more compact and smooth.
+
+### Combine Data
+
+```{r}
+hvfhv$source <- 'hvfhv'
+yellow_taxi$source <- 'taxi'
+yellow_taxi$trip_miles <- yellow_taxi$trip_distance
+
+hvfhv_selected <- hvfhv[, c("log_CarbonEmission", "time_period", "avg_temp", "PM2.5", "avg_speed_mph", "trip_miles", "trip_time", "pickup_borough", "source")]
+
+taxi_selected <- yellow_taxi[, c("log_CarbonEmission", "time_period", "avg_temp", "PM2.5","avg_speed_mph", "trip_miles", "trip_time", "pickup_borough", "source")]
+
+full_data <- rbind(hvfhv_selected, taxi_selected)
+
+head(full_data)
+
+```
+
+## Setting up the training set/test set
+
+```{r}
+full_data$time_period <- as.factor(full_data$time_period)
+full_data$pickup_borough <- as.factor(full_data$pickup_borough)
+full_data$source <- as.factor(full_data$source)
+names(full_data)[names(full_data) == "PM2.5"] <- "PM25"
+```
+
+```{r}
+set.seed(640)
+train_idx <- sample(seq_len(nrow(full_data)), size = 0.8 * nrow(full_data))
+train_data <- full_data[train_idx, ]
+test_data <- full_data[-train_idx, ]
+```
+
+```{r}
+x_train <- model.matrix(log_CarbonEmission ~ time_period + avg_temp + PM25 + avg_speed_mph + trip_miles + trip_time + pickup_borough + source, data = train_data)[, -1] 
+y_train <- train_data$log_CarbonEmission
+
+x_test <- model.matrix(log_CarbonEmission ~ time_period + avg_temp + PM25 + avg_speed_mph + trip_miles + trip_time + pickup_borough + source, data = test_data)[, -1]
+y_test <- test_data$log_CarbonEmission
+```
+
+We use set.seed(640) to fix the random number seed to ensure the repeatability of the experiment. Then, the original data set is divided into training set and test set in a ratio of 8:2 by simple random sampling. The training set (train_data) contains about 80% of the samples for model fitting and parameter learning; the test set (test_data) contains the remaining 20% ​​of the samples for independent verification of the generalization ability of the model.
+
+I use the model.matrix() function to convert the variables in the formula into a numerical matrix format suitable for linear modeling (i.e., the design matrix after one-hot encoding). In the formula, I set the response variable to log_CarbonEmission, the carbon emission after logarithmic transformation, and the explanatory variables include: time_period, avg_temp, PM25, avg_speed_mph, trip_miles, trip_time, pickup_borough, source.
+
+Through the [, -1] operation, I removed the intercept term (Intercept) in the design matrix to avoid duplication with the default intercept of some machine learning models. I got the input feature matrices x_train and x_test corresponding to the training set and test set, as well as the response variable vectors y_train and y_test, which can be directly used in the subsequent model training and prediction steps.
+
+## Predicting models training
+
+### Ridge (alpha=0)
+
+```{r}
+set.seed(640)
+cv_ridge <- cv.glmnet(x_train, y_train, alpha = 0, nfolds = 10) 
+plot(cv_ridge)
+
+best_lambda_ridge <- cv_ridge$lambda.min
+print(best_lambda_ridge)
+
+ridge_model <- glmnet(x_train, y_train, alpha = 0, lambda = best_lambda_ridge)
+
+ridge_pred <- predict(ridge_model, s = best_lambda_ridge, newx = x_test)
+
+ridge_rmse <- rmse(y_test, ridge_pred)
+ridge_mae <- mae(y_test, ridge_pred)
+ridge_r2 <- 1 - sum((y_test - ridge_pred)^2) / sum((y_test - mean(y_test))^2)
+
+cat("Ridge RMSE:", ridge_rmse, "\n")
+cat("Ridge MAE:", ridge_mae, "\n")
+cat("Ridge R2:", ridge_r2, "\n")
+```
+
+### Lasso (alpha=1)
+
+```{r}
+set.seed(640)
+cv_lasso <- cv.glmnet(x_train, y_train, alpha = 1, nfolds = 10) 
+plot(cv_lasso)
+
+best_lambda_lasso <- cv_lasso$lambda.min
+print(best_lambda_lasso)
+
+lasso_model <- glmnet(x_train, y_train, alpha = 1, lambda = best_lambda_lasso)
+
+lasso_pred <- predict(lasso_model, s = best_lambda_lasso, newx = x_test)
+
+lasso_rmse <- rmse(y_test, lasso_pred)
+lasso_mae <- mae(y_test, lasso_pred)
+lasso_r2 <- 1 - sum((y_test - lasso_pred)^2) / sum((y_test - mean(y_test))^2)
+
+cat("Lasso RMSE:", lasso_rmse, "\n")
+cat("Lasso MAE:", lasso_mae, "\n")
+cat("Lasso R2:", lasso_r2, "\n")
+```
+
+In order to deal with the multicollinearity problem that may exist in the data and improve the stability and generalization ability of the model, we chose to use two regularized linear models, Ridge Regression and Lasso Regression, as the initial modeling scheme. Compared with traditional linear regression, these two types of models introduce regularization terms in the loss function, which can effectively suppress model overfitting.
+
+After completing the model training and predicting the test set, we evaluated the performance of the two models respectively. The results of the Ridge model are RMSE = 0.385, MAE = 0.290, and R² = 0.832; while the Lasso model performs better in various indicators, reaching RMSE = 0.373, MAE = 0.269, and R² = 0.842, indicating that it has more advantages in capturing data structure and improving prediction accuracy. This also verifies our original intention of modeling, that is, to optimize the predictive ability and interpretability of the model by introducing regularization and variable selection mechanisms. After comprehensive consideration, the Lasso model can be used as a baseline model and provide a reliable comparison for the subsequent introduction of more complex nonlinear models.
+
+### Random Forest
+
+```{r}
+set.seed(640)
+rf_small <- train_data %>% sample_frac(0.01)
+
+formula <- log_CarbonEmission ~ time_period + avg_temp + PM25 + avg_speed_mph +
+           trip_miles + trip_time + pickup_borough + source
+
+tune_grid <- expand.grid(
+  mtry = c(4, 5, 6),      
+  splitrule = "variance",   
+  min.node.size = c(5, 10)
+)
+
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = TRUE,
+  allowParallel = TRUE
+)
+
+set.seed(640)
+rf_small_tuned <- train(
+  formula,
+  data = rf_small,
+  method = "ranger",
+  trControl = ctrl,
+  tuneGrid = tune_grid,
+  num.trees = 300,           
+  importance = "impurity",
+  metric = "RMSE"
+)
+
+print(rf_small_tuned)
+plot(rf_small_tuned)
+
+rf_small_tuned$bestTune
+
+```
+
+```{r}
+ctrl <- trainControl(
+  method = "cv",    
+  number = 10,    
+  verboseIter = TRUE
+)
+```
+
+```{r}
+set.seed(640) 
+rf <- ranger(
+  formula = log_CarbonEmission ~ time_period + avg_temp + PM25 + avg_speed_mph + trip_miles + trip_time + pickup_borough + source,
+  data = train_data,
+  num.trees = 300,
+  mtry = 5,
+  splitrule = "variance",
+  min.node.size = 5,
+  importance = "impurity",      
+  max.depth = 15,
+  sample.fraction = 0.7
+)
+
+rf
+```
+
+```{r}
+y_ranger_pred <- predict(rf, data = test_data)$predictions
+
+ranger_rmse <- rmse(test_data$log_CarbonEmission, y_ranger_pred)
+ranger_mae <- mae(test_data$log_CarbonEmission, y_ranger_pred)
+ranger_r2 <- 1 - sum((test_data$log_CarbonEmission - y_ranger_pred)^2) / sum((test_data$log_CarbonEmission - mean(test_data$log_CarbonEmission))^2)
+
+cat("Random Forest RMSE:", ranger_rmse, "\n")
+cat("Random Forest MAE:", ranger_mae, "\n")
+cat("Random Forest R2:", ranger_r2, "\n")
+```
+
+In order to further capture the possible nonlinear relationship between features, an ensemble learning method, Random Forest, was introduced. This model can effectively reduce the high variance problem of a single tree by constructing a large number of decision trees and averaging them.
+As an integrated learning method, randomForest has good fitting ability and robustness by constructing multiple decision trees and making integrated predictions. However, in the early stage of model tuning, due to the huge amount of data, the problem of memory overrun or computational interruption occurs when trying to use the standard randomForest package several times. For this reason, I switched to the more computationally efficient ranger package to build the model.
+Based on the ranger implementation, I systematically tuned the model hyperparameters through cross-validation. The parameter tuning goal is to minimize the RMSE of cross-validation. The final results show that the optimal parameter combination is: mtry = 5, splitrule = "variance", min.node.size = 5. Among them, mtry controls the number of variables randomly selected for each split, splitrule determines the splitting criterion, and min.node.size limits the minimum number of samples in the leaf node of each tree. These parameters work together to suppress overfitting while maintaining the model's expressiveness.
+The performance on the test set is good: RMSE = 0.0052, MAE = 0.0019, R^2= 0.99997. Although this result is extremely ideal, it also indicates the potential risk of overfitting.
+
+### XGBoost
+
+**Tune**
+
+```{r}
+set.seed(640)
+train_small <- train_data %>% sample_frac(0.01)
+
+x_train_small <- model.matrix(log_CarbonEmission ~ time_period + avg_temp + PM25 + avg_speed_mph +
+                              trip_miles + trip_time + pickup_borough + source,
+                              data = train_small)[, -1]
+y_train_small <- train_small$log_CarbonEmission
+dtrain_small <- xgb.DMatrix(data = x_train_small, label = y_train_small)
+
+
+param_grid <- expand.grid(
+  eta = c(0.01, 0.05, 0.1),
+  max_depth = c(4, 6, 8),
+  min_child_weight = c(1, 5, 10)
+)
+```
+
+```{r}
+results <- data.frame()
+
+for (i in 1:nrow(param_grid)) {
+  param <- list(
+    booster = "gbtree",
+    objective = "reg:squarederror",
+    eta = param_grid$eta[i],
+    max_depth = param_grid$max_depth[i],
+    min_child_weight = param_grid$min_child_weight[i],
+    subsample = 0.8,
+    colsample_bytree = 0.8
+  )
+  print(i)
+  set.seed(640)
+  xgbcv <- xgb.cv(
+    params = param,
+    data = dtrain_small,
+    nrounds = 500,
+    nfold = 5,
+    early_stopping_rounds = 20,
+    maximize = FALSE,
+    eval_metric = "rmse",
+    verbose = 0
+  )
+  
+  best_rmse <- min(xgbcv$evaluation_log$test_rmse_mean)
+  best_round <- which.min(xgbcv$evaluation_log$test_rmse_mean)
+  
+  results <- rbind(results, data.frame(
+    eta = param$eta,
+    max_depth = param$max_depth,
+    min_child_weight = param$min_child_weight,
+    best_rmse = best_rmse,
+    best_nrounds = best_round
+  ))
+}
+
+```
+
+```{r}
+results_sorted <- results[order(results$best_rmse), ]
+print(results_sorted)
+print(results_sorted[1, ])
+
+```
+
+```{r}
+formula <- log_CarbonEmission ~ time_period + avg_temp + PM25 + avg_speed_mph + 
+            trip_miles + trip_time + pickup_borough + source
+
+x_train <- model.matrix(formula, data = train_data)[, -1] 
+x_test <- model.matrix(formula, data = test_data)[, -1]
+
+y_train <- train_data$log_CarbonEmission
+y_test <- test_data$log_CarbonEmission
+
+dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+dtest <- xgb.DMatrix(data = x_test, label = y_test)
+
+```
+
+```{r}
+params <- list(
+  booster = "gbtree",    
+  objective = "reg:squarederror", 
+  eval_metric = "rmse", 
+  eta = 0.05,         
+  max_depth = 8,    
+  subsample = 0.7,      
+  colsample_bytree = 0.8,
+  min_child_weight = 1
+)
+```
+
+```{r}
+set.seed(640)
+
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 500, 
+  watchlist = list(train = dtrain, eval = dtest),
+  early_stopping_rounds = 20,
+  print_every_n = 10
+)
+
+```
+
+```{r}
+y_xgb_pred <- predict(xgb_model, newdata = dtest)
+
+xgb_rmse <- rmse(y_test, y_xgb_pred)
+xgb_mae <- mae(y_test, y_xgb_pred)
+xgb_r2 <- 1 - sum((y_test - y_xgb_pred)^2) / sum((y_test - mean(y_test))^2)
+
+cat("XGBoost RMSE:", xgb_rmse, "\n")
+cat("XGBoost MAE:", xgb_mae, "\n")
+cat("XGBoost R2:", xgb_r2, "\n")
+```
+
+Finally, the XGBoost model was introduced to improve prediction flexibility and model interpretability. 
+Considering that the total amount of our merged data set is close to 1.4 million, if we directly perform parameter tuning on the full amount of data, we will face practical challenges such as high consumption of computing resources and long running time. Therefore, in the parameter tuning stage, I adopted the strategy of randomly extracting 1% of samples from the original data for testing experiments. On this basis, we conducted a grid search, and the main adjustment parameters included learning rate (eta), maximum tree depth (max_depth), minimum number of leaf node samples (min_child_weight), etc. In the end, the model performed best under the parameter combination of eta = 0.05, max_depth = 8, and min_child_weight = 1. The cross-validation result RMSE was 0.0152 and the optimal round was 500. This combination achieved a good balance in learning speed and model complexity.
+After obtaining the optimal parameters, I applied them to the complete training set for modeling. The final performance of the model on the test set is: RMSE = 0.0051, MAE = 0.0032, R^2 = 0.99997, which is almost the same as the random forest. This result shows that XGBoost can fit the logarithm of carbon emissions with high precision, while having higher regulation flexibility and model interpretability. Since we introduced the early stopping strategy during the training process, once the error of the validation set no longer decreases, the training is stopped, which effectively avoids overfitting and makes the model also show good robustness on the actual test data.
+In summary, XGBoost is regarded as the modeling scheme with the most comprehensive advantages in this study due to its powerful nonlinear expression ability, adjustable parameter mechanism and good generalization performance.
+
+### Comparison
+
+```{r}
+model_results <- data.frame(
+  Model = c("Lasso Regression", "Random Forest", "XGBoost"),
+  RMSE = c(lasso_rmse, ranger_rmse, xgb_rmse),
+  MAE = c(lasso_mae, ranger_mae, xgb_mae),
+  R2 = c(lasso_r2, ranger_r2, xgb_r2)
+)
+
+print(model_results)
+```
+
+I built and evaluated three mainstream models: Lasso regression, Random Forest, and XGBoost to predict carbon emissions during travel. From the performance of the test set, although the Lasso model has relatively low prediction accuracy (RMSE = 0.373, R² = 0.842), it has good interpretability and variable selection capabilities, and is suitable as a linear benchmark model with strong interpretability. Random Forest and XGBoost significantly improved the prediction accuracy, reaching RMSE = 0.0052 and 0.0069 respectively, and R² is close to 1, which can almost completely fit the logarithm of carbon emissions. Among them, Random Forest is slightly better than XGBoost, but the latter has higher parameter adjustment flexibility and deployment efficiency, so it is also competitive in practicality.
+
+```{r}
+importance_values <- ranger::importance(rf)
+
+importance_df <- data.frame(
+  Feature = names(importance_values),
+  Importance = as.numeric(importance_values)
+)
+
+importance_df <- importance_df[order(-importance_df$Importance), ]
+
+head(importance_df, )
+
+```
+
+```{r}
+importance_matrix <- xgb.importance(feature_names = colnames(x_train), model = xgb_model)
+importance_matrix_sorted <- importance_matrix[order(-importance_matrix$Gain), ]
+head(importance_matrix_sorted, 5)
+```
+Further analyzing the feature importance of the model, we found that trip distance (trip_miles) and trip time (trip_time) are the most critical variables for predicting carbon emissions in both random forests and XGBoost. This finding is consistent with the mechanism of motor vehicle emissions: carbon emissions depend largely on the distance and time traveled. Average speed (avg_speed_mph) is the second most important. Although it contributes a small gain in XGBoost, it has a high split frequency, indicating that it frequently participates in the decision-making process in the model. In addition, the influence of administrative district information (pickup_borough) and travel mode (source) in both models is small, indicating that their marginal contribution to emissions is limited after controlling other variables.
+
+Considering the model performance and actual needs, we recommend using XGBoost first in large-scale deployment or real-time path optimization systems, which has strong computational efficiency and explanatory scalability while ensuring extremely high prediction accuracy. These prediction results have important practical significance: first, it enables us to accurately estimate the traffic carbon emissions in different areas in the next hour, thereby supporting the dynamic generation of "low-emission paths"; second, the system can provide a quantitative basis for the government to formulate time-limited traffic restrictions, environmental monitoring and emergency dispatch; it also provides users with a more environmentally friendly travel decision reference and helps achieve real-time management of individual carbon footprints. Overall, this research not only has strong predictive capabilities in algorithms, but also shows good landing value in application scenarios, which is in line with the development direction of future sustainable transportation systems.
